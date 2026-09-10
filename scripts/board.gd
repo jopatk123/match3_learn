@@ -1,7 +1,13 @@
 extends Node2D
 # =====================================================================
 # 开心消消乐 · 棋盘脚本
-# 已实现：M1（显示 8x8 彩色棋盘）+ M2（点击交换两块）
+# 已实现：M1（显示 8x8 彩色棋盘）+ M2（点击交换两块）+ M3（三连消除）
+# ---------------------------------------------------------------------
+# 【M3 新增一句话】消消乐的灵魂是一句大白话：
+#   交换之后，只要"同一方向上有连续 3 个以上同色"，就一起消失。
+# 我们把"找连续同色"和"把它们清掉"分成了两件事：
+#   _find_matches() 只负责"找"，_eliminate() 只负责"清"。
+# 这样思路干净，以后 M4 下落、M6 连锁都能复用同一套扫描。
 # ---------------------------------------------------------------------
 # 【最重要的一张图】数据与显示分离
 #
@@ -30,6 +36,8 @@ const COLS := 8
 const CELL_SIZE := 64
 # NONE 表示"当前没有任何格子被选中"。用 (-1,-1) 这个永远到不了的坐标当"空"。
 const NONE := Vector2i(-1, -1)
+# EMPTY 表示"这一格已经被消除，暂时空着"。用 -1 这个颜色编号里不存在的数当"空"。
+const EMPTY := -1
 
 # 四种颜色（现在是纯色占位，将来可替换成方块的图片）
 const COLORS := [
@@ -38,6 +46,9 @@ const COLORS := [
 	Color(0.96, 0.74, 0.14),  # 黄
 	Color(0.34, 0.78, 0.46),  # 绿
 ]
+
+# 空格的显示色（深灰半透明）——用来"标记一个洞"，让玩家看到哪里被消掉了。
+const EMPTY_COLOR := Color(0.15, 0.15, 0.15, 0.6)
 
 # 被选中时，把方块颜色"调亮"到这个倍率（>1 更亮）
 const HIGHLIGHT := Color(1.2, 1.2, 1.2)
@@ -126,8 +137,12 @@ func _build_view() -> void:
 
 # 让显示层第 (r,c) 个格子的颜色，和数据层 board[r][c] 重新对齐。
 #   这是唯一的"数据 → 画面"出口。以后所有改动都要经过它。
+#   M3 起多了一个情况：如果这一格是 EMPTY（被消掉了），就画成"洞"的颜色。
 func _refresh_tile(r: int, c: int) -> void:
-	_tiles[r][c].color = COLORS[board[r][c]]
+	if board[r][c] == EMPTY:
+		_tiles[r][c].color = EMPTY_COLOR
+	else:
+		_tiles[r][c].color = COLORS[board[r][c]]
 
 
 # ---------------------------------------------------------------
@@ -146,6 +161,7 @@ func _on_tile_clicked(r: int, c: int) -> void:
 	elif _is_neighbor(_selected, pos):
 		_swap(_selected, pos)       # ③ 点相邻格 → 交换
 		_clear_selection()          #    换完取消高亮（准备下一轮）
+		_resolve_matches()          # ④ M3新增：换完立刻扫描并消除三连
 	else:
 		_set_selected(pos)          # ④ 点不相邻 → 改成选中这一格
 
@@ -174,3 +190,70 @@ func _swap(a: Vector2i, b: Vector2i) -> void:
 	board[b.y][b.x] = tmp              # B 拿到原 A 的值
 	_refresh_tile(a.y, a.x)            # 让两格的画面跟着改
 	_refresh_tile(b.y, b.x)
+
+
+# ---------------------------------------------------------------
+# 消除逻辑（M3 核心）：
+#   分成两层——先用 _find_matches 找出"所有要消的格子"，
+#   再用 _eliminate 把这一批格子同时清空。
+# ---------------------------------------------------------------
+
+# 入口：扫描棋盘，如果找到了三连，就让它们一起消失。
+func _resolve_matches() -> void:
+	var matched := _find_matches()     # 拿到所有要消格子的集合
+	if matched.size() > 0:
+		_eliminate(matched)            # 有才消，没找到就是没成三连
+
+
+# 扫描整张棋盘，返回"所有同色连续 >=3 的格子"。
+#   返回值是个 Dictionary（字典）：键是 "行,列" 这样的字符串，值无所谓 true。
+#   用它当"集合"用，因为同一个格子可能被横、竖、斜都扫到，字典能自动去重。
+func _find_matches() -> Dictionary:
+	var matched := {}
+
+	# 四个方向，依次扫一遍：
+	#   右(横) 下(竖) 右下(一条斜线) 左下(另一条斜线)
+	# 每个方向都是一套同样的"顺着走、数连续几个同色"的逻辑，所以抽成 _scan_dir。
+	var dirs := [Vector2i(1, 0), Vector2i(0, 1), Vector2i(1, 1), Vector2i(1, -1)]
+	for dir in dirs:
+		_scan_dir(matched, dir)
+	return matched
+
+
+# 从每个格子出发，沿 dir 方向数"连续同色有几个"，>=3 就把它们全记进 matched。
+func _scan_dir(matched: Dictionary, dir: Vector2i) -> void:
+	# 起点可以是棋盘上任意一格（格子本身的坐标先算进去）
+	for r in ROWS:
+		for c in COLS:
+			var color: int = board[r][c]     # board 是未定型的数组，取出的是 Variant，要显式声明
+			if color == EMPTY:               # 空空格没有颜色，跳过，别拿它当起点
+				continue
+
+			var run: Array = [Vector2i(c, r)]  # run = 这一串"连续同色"的坐标列表，先有自己
+			var cr := r
+			var cc := c
+			# 顺着 dir 一步、一步往前挪（cr, cc）
+			while true:
+				cr += dir.y                  # 行方向（上下）
+				cc += dir.x                  # 列方向（左右）
+				if cr < 0 or cr >= ROWS or cc < 0 or cc >= COLS:
+					break                    # 出界了，这是这一串的尽头
+				if board[cr][cc] != color:
+					break                    # 颜色不一样了，也是尽头
+				run.append(Vector2i(cc, cr)) # 同色 → 加进当前这一串
+
+			# 这一串 >=3 才够成"三连"，把它们全部记下来
+			if run.size() >= 3:
+				for pos in run:
+					matched["%d,%d" % [pos.y, pos.x]] = true
+
+
+# 把 matched 里记录的所有格子，统一设成 EMPTY（清空），并同步画面。
+func _eliminate(matched: Dictionary) -> void:
+	# 字典的每个键都是我们存的 "行,列" 字符串，拆回数字就能定位格子
+	for key in matched.keys():
+		var parts: PackedStringArray = key.split(",")
+		var r := int(parts[0])
+		var c := int(parts[1])
+		board[r][c] = EMPTY                # 数据层：这一格变成"空"
+		_refresh_tile(r, c)                # 画面层：同步成"洞"的颜色
