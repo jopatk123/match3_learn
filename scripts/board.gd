@@ -1,13 +1,15 @@
 extends Node2D
 # =====================================================================
 # 开心消消乐 · 棋盘脚本
-# 已实现：M1（显示 8x8 彩色棋盘）+ M2（点击交换两块）+ M3（三连消除）
+# 已实现：M1 棋盘 + M2 交换 + M3 三连消除 + M4 下落 + M5 计分 + M6 连锁
 # ---------------------------------------------------------------------
 # 【M3 新增一句话】消消乐的灵魂是一句大白话：
-#   交换之后，只要"同一方向上有连续 3 个以上同色"，就一起消失。
+#   交换之后，只要"横着或竖着连续 3 个以上同色"，就一起消失（斜的不算）。
 # 我们把"找连续同色"和"把它们清掉"分成了两件事：
 #   _find_matches() 只负责"找"，_eliminate() 只负责"清"。
-# 这样思路干净，以后 M4 下落、M6 连锁都能复用同一套扫描。
+# 这样思路干净，M4 下落、M6 连锁都复用同一套扫描。
+# 【M6 一句话】棋盘必须"结算到稳定"：消完下落如果又出现三连，就再消，
+#   直到扫不到三连为止。只消一轮会把新三连留在棋盘上，那是规则没做完。
 # ---------------------------------------------------------------------
 # 【最重要的一张图】数据与显示分离
 #
@@ -38,6 +40,11 @@ const CELL_SIZE := 64
 const NONE := Vector2i(-1, -1)
 # EMPTY 表示"这一格已经被消除，暂时空着"。用 -1 这个颜色编号里不存在的数当"空"。
 const EMPTY := -1
+
+# ⑥ M6：连锁的"保险丝"。正常玩法要一直消到棋盘稳定；
+#   这个上限只防极端情况下随机补块形成几乎无穷的连锁，把游戏卡死。
+#   8 太小——8x8 四色很容易连过 8 轮，轮次用尽就会把三连留在棋盘上。
+const CHAIN_LIMIT := 64
 
 # 四种颜色（现在是纯色占位，将来可替换成方块的图片）
 const COLORS := [
@@ -83,22 +90,68 @@ var _score_label: Label = null
 # ---------------------------------------------------------------
 
 func _ready() -> void:
-	_build_data() # 第一步：往 board 里随机填颜色编号
+	randomize() # 每次打开游戏用不同随机种子，棋盘才不会千篇一律
+	_build_data() # 第一步：往 board 里填颜色编号（逐格避开三连）
 	_build_view() # 第二步：按 board 生成 64 个 ColorRect 画出来
+	# 开局再结算一次：生成兜底万一还有三连，瞬间消干净。分数清零，不算开局分。
+	_resolve_matches()
+	score = 0
+	_score_label.text = "0"
 
 
 # ---------------------------------------------------------------
 # 数据层：负责"算"，不负责"画"
 # ---------------------------------------------------------------
 
-# 生成 8x8 的随机数据。每个格子用 randi()%4 取 0~3 的随机数。
+# 生成 8x8 开局。从左到右、从上到下逐格放，
+# 放之前先问"这个颜色会不会跟已经放好的格子构成横/竖三连"。
 func _build_data() -> void:
-	board.clear() # 清空旧的
-	for r in ROWS: # 外层：走遍每一"行"
+	board.clear()
+	# 先铺一层 EMPTY，这样放第 (r,c) 格时，board[r][c] 已经能按下标访问。
+	for r in ROWS:
 		var row: Array = []
-		for c in COLS: # 内层：在一行里走遍每一"列"
-			row.append(randi() % COLORS.size())
-		board.append(row) # 把这一行装进 board
+		for c in COLS:
+			row.append(EMPTY)
+		board.append(row)
+
+	for r in ROWS:
+		for c in COLS:
+			board[r][c] = _pick_color_without_match(r, c)
+
+
+# 格子 (r,c) 是否在棋盘里面。后面生成、扫描都会用到，抽出来避免重复写四个不等式。
+func _in_bounds(r: int, c: int) -> bool:
+	return r >= 0 and r < ROWS and c >= 0 and c < COLS
+
+
+# 在 (r,c) 放入 color 之后，会不会立刻跟"已经填好的格子"构成横/竖三连。
+# 按行优先从左上往右下填，只需往已经填过的方向看两格：左（横）、上（竖）。
+func _would_match_at(r: int, c: int, color: int) -> bool:
+	var backs := [
+		Vector2i(-1, 0), # 左（横）
+		Vector2i(0, -1), # 上（竖）
+	]
+	for d in backs:
+		var r1: int = r + d.y
+		var c1: int = c + d.x
+		var r2: int = r + d.y * 2
+		var c2: int = c + d.x * 2
+		if _in_bounds(r1, c1) and _in_bounds(r2, c2):
+			if board[r1][c1] == color and board[r2][c2] == color:
+				return true
+	return false
+
+
+# 从 4 种颜色里随机挑一个"放下去不会成横/竖三连"的。
+# 极少数格子横竖都禁同一种色时，只好随便放一个，开局的 _resolve_matches 会把漏网的消掉。
+func _pick_color_without_match(r: int, c: int) -> int:
+	var choices: Array = []
+	for color in COLORS.size():
+		if not _would_match_at(r, c, color):
+			choices.append(color)
+	if choices.is_empty():
+		return randi() % COLORS.size()
+	return choices[randi() % choices.size()]
 
 
 # ---------------------------------------------------------------
@@ -116,13 +169,6 @@ func _build_view() -> void:
 			tile.size = Vector2(CELL_SIZE, CELL_SIZE) # 宽高 64
 			tile.position = Vector2(c, r) * CELL_SIZE # 摆到 (列,行) 位置
 			add_child(tile) # 挂到节点树里，"出现在屏幕上"
-
-			# 实验：添加一个文本标签作为 tile 的孩子
-			var label := Label.new()
-			label.text = str(r) + "," + str(c) # 显示坐标
-			label.position = Vector2(10, 25)
-			label.add_theme_font_size_override("font_size", 14)
-			tile.add_child(label) # ← 看！tile 也有孩子了！
 
 			# 每个格子自己监听点击。
 			# 用闭包把 r,c 记住（rr,cc 是副本），这样回调里直接知道"我在这格"。
@@ -144,7 +190,7 @@ func _build_view() -> void:
 	_score_label = Label.new()
 	_score_label.text = str(score) # 初始分数 0
 	_score_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER # 文字水平居中
-	_score_label.size = Vector2(ROWS * CELL_SIZE, 60) # 宽=棋盘宽，高 60
+	_score_label.size = Vector2(COLS * CELL_SIZE, 60) # 宽=棋盘宽（列数 × 格子边长），高 60
 	_score_label.position = Vector2(0, -62) # 放在棋盘上方一点
 	_score_label.add_theme_font_size_override("font_size", 40) # 字号加大
 	add_child(_score_label) # 挂到节点树上
@@ -213,24 +259,30 @@ func _swap(a: Vector2i, b: Vector2i) -> void:
 #   再用 _eliminate 把这一批格子同时清空。
 # ---------------------------------------------------------------
 
-# 入口：扫描棋盘，如果找到了三连，就让它们一起消失，然后上面的方块下落补位。
+# 入口：把棋盘结算到"稳定"——扫不到三连才停。
+# ⑥ M6：交换后、下落后、顶部补出的新方块，都可能再构成三连。
+#   只消一轮就会把新三连留在棋盘上（测试时看到的那种），所以必须循环。
+#   for + CHAIN_LIMIT 是保险丝；正常情况会在远小于上限时因 matched 为空而结束。
 func _resolve_matches() -> void:
-	var matched := _find_matches() # 拿到所有要消格子的集合
-	if matched.size() > 0:
-		_eliminate(matched) # 有才消，没找到就是没成三连
-		_apply_gravity() # ④ M4新增：消完让方块下落、顶上补新
+	for _round in CHAIN_LIMIT:
+		var matched := _find_matches() # 每次循环都重新扫一遍棋盘
+		if matched.is_empty():
+			return # 稳定了：没有三连，可以交给玩家继续玩
+		_eliminate(matched)
+		_apply_gravity() # 下落 + 顶部补新块 → 可能又有三连 → 下一轮再扫
+	# 走到这里说明保险丝烧了。棋盘上可能还留着三连，打一行警告方便以后发现。
+	push_warning("连锁超过 CHAIN_LIMIT，棋盘可能仍有三连")
 
 
 # 扫描整张棋盘，返回"所有同色连续 >=3 的格子"。
 #   返回值是个 Dictionary（字典）：键是 "行,列" 这样的字符串，值无所谓 true。
-#   用它当"集合"用，因为同一个格子可能被横、竖、斜都扫到，字典能自动去重。
+#   用它当"集合"用，因为同一个格子可能同时属于一条横三连和一条竖三连，字典能自动去重。
 func _find_matches() -> Dictionary:
 	var matched := {}
 
-	# 四个方向，依次扫一遍：
-	#   右(横) 下(竖) 右下(一条斜线) 左下(另一条斜线)
-	# 每个方向都是一套同样的"顺着走、数连续几个同色"的逻辑，所以抽成 _scan_dir。
-	var dirs := [Vector2i(1, 0), Vector2i(0, 1), Vector2i(1, 1), Vector2i(1, -1)]
+	# 只扫两个方向：右（横）、下（竖）。斜向不算三连。
+	# 每个格子都会当起点，所以朝一个走向扫就覆盖整行/整列。
+	var dirs := [Vector2i(1, 0), Vector2i(0, 1)]
 	for dir in dirs:
 		_scan_dir(matched, dir)
 	return matched
@@ -252,7 +304,7 @@ func _scan_dir(matched: Dictionary, dir: Vector2i) -> void:
 			while true:
 				cr += dir.y # 行方向（上下）
 				cc += dir.x # 列方向（左右）
-				if cr < 0 or cr >= ROWS or cc < 0 or cc >= COLS:
+				if not _in_bounds(cr, cc):
 					break # 出界了，这是这一串的尽头
 				if board[cr][cc] != color:
 					break # 颜色不一样了，也是尽头
