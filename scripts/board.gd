@@ -1,7 +1,10 @@
 extends Node2D
 # =====================================================================
 # 开心消消乐 · 棋盘脚本
-# 已实现：M1 棋盘 + M2 交换 + M3 三连消除 + M4 下落 + M5 计分 + M6 连锁
+# 已实现：M1–M6 核心规则 + M7.1 锁输入
+# 【M7.1 一句话】棋盘在「结算」时是忙碌的：忙碌期间点击全部丢掉。
+#   现在结算几乎瞬间结束，所以锁看起来像没效果——这是正常的。
+#   后面做滑动/下落时，忙碌会持续整段动画，那时你就能明显感觉到点不动。
 # ---------------------------------------------------------------------
 # 【M3 新增一句话】消消乐的灵魂是一句大白话：
 #   交换之后，只要"横着或竖着连续 3 个以上同色"，就一起消失（斜的不算）。
@@ -79,6 +82,10 @@ var _tiles: Array = []
 #   用下划线前缀 _ 表示"内部私有变量"，提醒自己别在别处乱碰
 var _selected := NONE
 
+# ⑦ M7.1：棋盘忙不忙。true = 正在结算（或以后的动画中），这时不接受新点击。
+#   它是交互状态机的第三种状态：空闲未选 / 已选中某格 / 忙碌。
+var _busy := false
+
 # ⑤ M5 计分：当前累积的总分
 var score: int = 0
 # 显示分数的文字标签（显示层的一部分，和 _tiles 是一家人）
@@ -94,7 +101,10 @@ func _ready() -> void:
 	_build_data() # 第一步：往 board 里填颜色编号（逐格避开三连）
 	_build_view() # 第二步：按 board 生成 64 个 ColorRect 画出来
 	# 开局再结算一次：生成兜底万一还有三连，瞬间消干净。分数清零，不算开局分。
+	# 和游戏中同一套锁：结算时点不动。开局其实还点不到（画面刚出来），但规则要统一。
+	_busy = true
 	_resolve_matches()
+	_busy = false
 	score = 0
 	_score_label.text = "0"
 
@@ -213,6 +223,11 @@ func _refresh_tile(r: int, c: int) -> void:
 
 # 任何格子被点击后，统一到这里来"决策"。
 func _on_tile_clicked(r: int, c: int) -> void:
+	# ⑦ M7.1：忙碌时直接丢掉这次点击。
+	#   不要清选中、不要交换——玩家的手还在，棋盘只是暂时不听。
+	if _busy:
+		return
+
 	var pos := Vector2i(c, r) # 点击处：x=列, y=行
 
 	if _selected == NONE:
@@ -220,9 +235,12 @@ func _on_tile_clicked(r: int, c: int) -> void:
 	elif _selected == pos:
 		_clear_selection() # ② 点的是同一格 → 取消选中
 	elif _is_neighbor(_selected, pos):
-		_swap(_selected, pos) # ③ 点相邻格 → 交换
+		# ③ 点相邻格 → 交换并结算。整段过程都算忙碌。
+		_busy = true
+		_swap(_selected, pos)
 		_clear_selection() # 换完取消高亮（准备下一轮）
-		_resolve_matches() # ④ M3新增：换完立刻扫描并消除三连
+		_resolve_matches() # ④ 换完立刻扫描并消除三连（含连锁）
+		_busy = false
 	else:
 		_set_selected(pos) # ④ 点不相邻 → 改成选中这一格
 
