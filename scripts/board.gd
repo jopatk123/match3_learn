@@ -41,10 +41,10 @@ const EMPTY := -1
 
 # 四种颜色（现在是纯色占位，将来可替换成方块的图片）
 const COLORS := [
-	Color(0.92, 0.30, 0.28),  # 红
-	Color(0.28, 0.56, 0.92),  # 蓝
-	Color(0.96, 0.74, 0.14),  # 黄
-	Color(0.34, 0.78, 0.46),  # 绿
+	Color(0.92, 0.30, 0.28), # 红
+	Color(0.28, 0.56, 0.92), # 蓝
+	Color(0.96, 0.74, 0.14), # 黄
+	Color(0.34, 0.78, 0.46), # 绿
 ]
 
 # 空格的显示色（深灰半透明）——用来"标记一个洞"，让玩家看到哪里被消掉了。
@@ -72,14 +72,19 @@ var _tiles: Array = []
 #   用下划线前缀 _ 表示"内部私有变量"，提醒自己别在别处乱碰
 var _selected := NONE
 
+# ⑤ M5 计分：当前累积的总分
+var score: int = 0
+# 显示分数的文字标签（显示层的一部分，和 _tiles 是一家人）
+var _score_label: Label = null
+
 
 # ---------------------------------------------------------------
 # 生命周期：节点一进入场景树就自动调用的入口函数（只跑一次）
 # ---------------------------------------------------------------
 
 func _ready() -> void:
-	_build_data()   # 第一步：往 board 里随机填颜色编号
-	_build_view()   # 第二步：按 board 生成 64 个 ColorRect 画出来
+	_build_data() # 第一步：往 board 里随机填颜色编号
+	_build_view() # 第二步：按 board 生成 64 个 ColorRect 画出来
 
 
 # ---------------------------------------------------------------
@@ -88,12 +93,12 @@ func _ready() -> void:
 
 # 生成 8x8 的随机数据。每个格子用 randi()%4 取 0~3 的随机数。
 func _build_data() -> void:
-	board.clear()               # 清空旧的
-	for r in ROWS:              # 外层：走遍每一"行"
+	board.clear() # 清空旧的
+	for r in ROWS: # 外层：走遍每一"行"
 		var row: Array = []
-		for c in COLS:          # 内层：在一行里走遍每一"列"
+		for c in COLS: # 内层：在一行里走遍每一"列"
 			row.append(randi() % COLORS.size())
-		board.append(row)       # 把这一行装进 board
+		board.append(row) # 把这一行装进 board
 
 
 # ---------------------------------------------------------------
@@ -106,18 +111,18 @@ func _build_view() -> void:
 	for r in ROWS:
 		var row: Array = []
 		for c in COLS:
-			var tile := ColorRect.new()          # 新建一个矩形节点
-			tile.color = COLORS[board[r][c]]     # 用数字查颜色，赋给它
-			tile.size = Vector2(CELL_SIZE, CELL_SIZE)              # 宽高 64
-			tile.position = Vector2(c, r) * CELL_SIZE              # 摆到 (列,行) 位置
-			add_child(tile)                      # 挂到节点树里，"出现在屏幕上"
+			var tile := ColorRect.new() # 新建一个矩形节点
+			tile.color = COLORS[board[r][c]] # 用数字查颜色，赋给它
+			tile.size = Vector2(CELL_SIZE, CELL_SIZE) # 宽高 64
+			tile.position = Vector2(c, r) * CELL_SIZE # 摆到 (列,行) 位置
+			add_child(tile) # 挂到节点树里，"出现在屏幕上"
 
 			# 实验：添加一个文本标签作为 tile 的孩子
 			var label := Label.new()
-			label.text = str(r) + "," + str(c)  # 显示坐标
+			label.text = str(r) + "," + str(c) # 显示坐标
 			label.position = Vector2(10, 25)
 			label.add_theme_font_size_override("font_size", 14)
-			tile.add_child(label)  # ← 看！tile 也有孩子了！
+			tile.add_child(label) # ← 看！tile 也有孩子了！
 
 			# 每个格子自己监听点击。
 			# 用闭包把 r,c 记住（rr,cc 是副本），这样回调里直接知道"我在这格"。
@@ -128,11 +133,21 @@ func _build_view() -> void:
 				if event is InputEventMouseButton \
 					and event.pressed \
 					and event.button_index == MOUSE_BUTTON_LEFT:
-					_on_tile_clicked(rr, cc)     # 转交给整个棋盘统一处理
+					_on_tile_clicked(rr, cc) # 转交给整个棋盘统一处理
 			)
 
 			row.append(tile)
 		_tiles.append(row)
+
+	# ⑤ M5：在棋盘上方画一个"分数"标签。
+	#   Label 是"文字控件"，横跨整个棋盘宽度、水平居中，让文字显示在正中间。
+	_score_label = Label.new()
+	_score_label.text = str(score) # 初始分数 0
+	_score_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER # 文字水平居中
+	_score_label.size = Vector2(ROWS * CELL_SIZE, 60) # 宽=棋盘宽，高 60
+	_score_label.position = Vector2(0, -62) # 放在棋盘上方一点
+	_score_label.add_theme_font_size_override("font_size", 40) # 字号加大
+	add_child(_score_label) # 挂到节点树上
 
 
 # 让显示层第 (r,c) 个格子的颜色，和数据层 board[r][c] 重新对齐。
@@ -152,28 +167,28 @@ func _refresh_tile(r: int, c: int) -> void:
 
 # 任何格子被点击后，统一到这里来"决策"。
 func _on_tile_clicked(r: int, c: int) -> void:
-	var pos := Vector2i(c, r)     # 点击处：x=列, y=行
+	var pos := Vector2i(c, r) # 点击处：x=列, y=行
 
 	if _selected == NONE:
-		_set_selected(pos)          # ① 之前没选中 → 选中这一格
+		_set_selected(pos) # ① 之前没选中 → 选中这一格
 	elif _selected == pos:
-		_clear_selection()          # ② 点的是同一格 → 取消选中
+		_clear_selection() # ② 点的是同一格 → 取消选中
 	elif _is_neighbor(_selected, pos):
-		_swap(_selected, pos)       # ③ 点相邻格 → 交换
-		_clear_selection()          #    换完取消高亮（准备下一轮）
-		_resolve_matches()          # ④ M3新增：换完立刻扫描并消除三连
+		_swap(_selected, pos) # ③ 点相邻格 → 交换
+		_clear_selection() # 换完取消高亮（准备下一轮）
+		_resolve_matches() # ④ M3新增：换完立刻扫描并消除三连
 	else:
-		_set_selected(pos)          # ④ 点不相邻 → 改成选中这一格
+		_set_selected(pos) # ④ 点不相邻 → 改成选中这一格
 
 # 把 _selected 改成某个格子，并把它的颜色调亮（高亮框）
 func _set_selected(pos: Vector2i) -> void:
-	_clear_selection()              # 先清旧的高亮，避免出现两格同时高亮
+	_clear_selection() # 先清旧的高亮，避免出现两格同时高亮
 	_selected = pos
 	_tiles[pos.y][pos.x].modulate = HIGHLIGHT
 
 # 把当前高亮取消：颜色恢复正常，_selected 设回 NONE
 func _clear_selection() -> void:
-	if _selected == NONE:           # 本来就空闲，直接返回
+	if _selected == NONE: # 本来就空闲，直接返回
 		return
 	_tiles[_selected.y][_selected.x].modulate = NORMAL
 	_selected = NONE
@@ -185,10 +200,10 @@ func _is_neighbor(a: Vector2i, b: Vector2i) -> bool:
 
 # 交换数据层两格的值，并同步显示层颜色（真正的"换位"动作）
 func _swap(a: Vector2i, b: Vector2i) -> void:
-	var tmp = board[a.y][a.x]          # 暂存格A的值
-	board[a.y][a.x] = board[b.y][b.x]  # A 拿到 B 的值
-	board[b.y][b.x] = tmp              # B 拿到原 A 的值
-	_refresh_tile(a.y, a.x)            # 让两格的画面跟着改
+	var tmp = board[a.y][a.x] # 暂存格A的值
+	board[a.y][a.x] = board[b.y][b.x] # A 拿到 B 的值
+	board[b.y][b.x] = tmp # B 拿到原 A 的值
+	_refresh_tile(a.y, a.x) # 让两格的画面跟着改
 	_refresh_tile(b.y, b.x)
 
 
@@ -198,11 +213,12 @@ func _swap(a: Vector2i, b: Vector2i) -> void:
 #   再用 _eliminate 把这一批格子同时清空。
 # ---------------------------------------------------------------
 
-# 入口：扫描棋盘，如果找到了三连，就让它们一起消失。
+# 入口：扫描棋盘，如果找到了三连，就让它们一起消失，然后上面的方块下落补位。
 func _resolve_matches() -> void:
-	var matched := _find_matches()     # 拿到所有要消格子的集合
+	var matched := _find_matches() # 拿到所有要消格子的集合
 	if matched.size() > 0:
-		_eliminate(matched)            # 有才消，没找到就是没成三连
+		_eliminate(matched) # 有才消，没找到就是没成三连
+		_apply_gravity() # ④ M4新增：消完让方块下落、顶上补新
 
 
 # 扫描整张棋盘，返回"所有同色连续 >=3 的格子"。
@@ -225,21 +241,21 @@ func _scan_dir(matched: Dictionary, dir: Vector2i) -> void:
 	# 起点可以是棋盘上任意一格（格子本身的坐标先算进去）
 	for r in ROWS:
 		for c in COLS:
-			var color: int = board[r][c]     # board 是未定型的数组，取出的是 Variant，要显式声明
-			if color == EMPTY:               # 空空格没有颜色，跳过，别拿它当起点
+			var color: int = board[r][c] # board 是未定型的数组，取出的是 Variant，要显式声明
+			if color == EMPTY: # 空空格没有颜色，跳过，别拿它当起点
 				continue
 
-			var run: Array = [Vector2i(c, r)]  # run = 这一串"连续同色"的坐标列表，先有自己
+			var run: Array = [Vector2i(c, r)] # run = 这一串"连续同色"的坐标列表，先有自己
 			var cr := r
 			var cc := c
 			# 顺着 dir 一步、一步往前挪（cr, cc）
 			while true:
-				cr += dir.y                  # 行方向（上下）
-				cc += dir.x                  # 列方向（左右）
+				cr += dir.y # 行方向（上下）
+				cc += dir.x # 列方向（左右）
 				if cr < 0 or cr >= ROWS or cc < 0 or cc >= COLS:
-					break                    # 出界了，这是这一串的尽头
+					break # 出界了，这是这一串的尽头
 				if board[cr][cc] != color:
-					break                    # 颜色不一样了，也是尽头
+					break # 颜色不一样了，也是尽头
 				run.append(Vector2i(cc, cr)) # 同色 → 加进当前这一串
 
 			# 这一串 >=3 才够成"三连"，把它们全部记下来
@@ -250,10 +266,44 @@ func _scan_dir(matched: Dictionary, dir: Vector2i) -> void:
 
 # 把 matched 里记录的所有格子，统一设成 EMPTY（清空），并同步画面。
 func _eliminate(matched: Dictionary) -> void:
+	# ⑤ M5：先计分。matched.size() = 这次一共消掉几格（字典已自动去重）。
+	#   每消一格 +10 分，然后把新分数立刻显示到标签上。
+	score += matched.size() * 10
+	_score_label.text = str(score)
+
 	# 字典的每个键都是我们存的 "行,列" 字符串，拆回数字就能定位格子
 	for key in matched.keys():
 		var parts: PackedStringArray = key.split(",")
 		var r := int(parts[0])
 		var c := int(parts[1])
-		board[r][c] = EMPTY                # 数据层：这一格变成"空"
-		_refresh_tile(r, c)                # 画面层：同步成"洞"的颜色
+		board[r][c] = EMPTY # 数据层：这一格变成"空"
+		_refresh_tile(r, c) # 画面层：同步成"洞"的颜色
+
+
+# M4 核心：下落补位。一列一列处理——
+#   ① 从下往上，把这列里"还有颜色"的格子数出来（去掉空位）
+#   ② 从最底行开始，把这些方块原样码回去（等于整体砸到底）
+#   ③ 顶部空出来的位置，用随机新颜色填上
+func _apply_gravity() -> void:
+	for c in COLS: # 列与列互不干扰，逐列扫
+		var col: Array = [] # 临时存"这一列里还活着的方块"
+		for r in range(ROWS - 1, -1, -1): # 注意：从最底行往上走
+			if board[r][c] != EMPTY: # 不是洞才收进来，"压实"把洞挤掉
+				col.append(board[r][c])
+
+		# 从最底行往上，把收好的方块一本一本码回去
+		#   col 的顺序是 [最底…最顶]，从底开始放正好保持上下关系不变
+		var write_r := ROWS - 1
+		for value in col:
+			board[write_r][c] = value
+			write_r -= 1
+
+		# 现在 write_r 及以上的格子都是空的，补上随机新方块
+		while write_r >= 0:
+			board[write_r][c] = randi() % COLORS.size()
+			write_r -= 1
+
+	# 数据层全部改完，统一刷新画面（只用 _refresh_tile 这一个出口）
+	for r in ROWS:
+		for c in COLS:
+			_refresh_tile(r, c)
