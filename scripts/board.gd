@@ -1,10 +1,12 @@
 extends Node2D
 # =====================================================================
 # 开心消消乐 · 棋盘脚本
-# 已实现：M1–M6 核心规则 + M7.1 锁输入
-# 【M7.1 一句话】棋盘在「结算」时是忙碌的：忙碌期间点击全部丢掉。
-#   现在结算几乎瞬间结束，所以锁看起来像没效果——这是正常的。
-#   后面做滑动/下落时，忙碌会持续整段动画，那时你就能明显感觉到点不动。
+# 已实现：M1–M6 核心规则 + M7.1 锁输入 + M7.2 交换滑动
+# 【M7.1 一句话】棋盘在「结算 / 动画」时是忙碌的：忙碌期间点击全部丢掉。
+# 【M7.2 一句话】交换不再瞬间换色，而是两块滑向对方；滑完再问「有没有三连」。
+#   有 → 坐下（节点弹回自己的格子、颜色跟上数据），再走原来的消除结算。
+#   没有 → 滑回去（回弹），数据不动。这一步才让「乱换」看起来像被拒绝。
+#   滑动这段时间 _busy 一直为 true，M7.1 那把锁终于能被肉眼感觉到。
 # ---------------------------------------------------------------------
 # 【M3 新增一句话】消消乐的灵魂是一句大白话：
 #   交换之后，只要"横着或竖着连续 3 个以上同色"，就一起消失（斜的不算）。
@@ -64,6 +66,8 @@ const EMPTY_COLOR := Color(0.15, 0.15, 0.15, 0.6)
 const HIGHLIGHT := Color(1.2, 1.2, 1.2)
 # 没选中的正常色（白色=不改变原色）
 const NORMAL := Color.WHITE
+# ⑧ M7.2：两块滑过去 / 滑回来各用这么多秒。数字越大动作越慢，方便看清楚。
+const SWAP_DURATION := 0.18
 
 
 # ---------------------------------------------------------------
@@ -82,7 +86,7 @@ var _tiles: Array = []
 #   用下划线前缀 _ 表示"内部私有变量"，提醒自己别在别处乱碰
 var _selected := NONE
 
-# ⑦ M7.1：棋盘忙不忙。true = 正在结算（或以后的动画中），这时不接受新点击。
+# ⑦ M7.1：棋盘忙不忙。true = 正在滑动 / 回弹 / 结算，这时不接受新点击。
 #   它是交互状态机的第三种状态：空闲未选 / 已选中某格 / 忙碌。
 var _busy := false
 
@@ -235,11 +239,12 @@ func _on_tile_clicked(r: int, c: int) -> void:
 	elif _selected == pos:
 		_clear_selection() # ② 点的是同一格 → 取消选中
 	elif _is_neighbor(_selected, pos):
-		# ③ 点相邻格 → 交换并结算。整段过程都算忙碌。
+		# ③ 点相邻格 → 先滑过去，再决定「留下」还是「弹回」。
+		#    整段动画 + 后面的结算都算忙碌，所以 M7.1 的锁会一直握住。
 		_busy = true
-		_swap(_selected, pos)
-		_clear_selection() # 换完取消高亮（准备下一轮）
-		_resolve_matches() # ④ 换完立刻扫描并消除三连（含连锁）
+		var from := _selected
+		_clear_selection() # 先取消高亮，别让「发光」跟着滑
+		await _try_swap(from, pos)
 		_busy = false
 	else:
 		_set_selected(pos) # ④ 点不相邻 → 改成选中这一格
@@ -262,13 +267,56 @@ func _clear_selection() -> void:
 func _is_neighbor(a: Vector2i, b: Vector2i) -> bool:
 	return abs(a.x - b.x) + abs(a.y - b.y) == 1
 
-# 交换数据层两格的值，并同步显示层颜色（真正的"换位"动作）
-func _swap(a: Vector2i, b: Vector2i) -> void:
-	var tmp = board[a.y][a.x] # 暂存格A的值
-	board[a.y][a.x] = board[b.y][b.x] # A 拿到 B 的值
-	board[b.y][b.x] = tmp # B 拿到原 A 的值
-	_refresh_tile(a.y, a.x) # 让两格的画面跟着改
+# 格子 (r,c) 在屏幕上应处的左上角。滑动的起点 / 终点都用它，避免手写两遍乘法。
+func _grid_pos(pos: Vector2i) -> Vector2:
+	return Vector2(pos.x, pos.y) * CELL_SIZE
+
+
+# 只改数据层：对调 board 里两个格子的颜色编号，不动画面。
+#   滑动过程中画面由节点自己「走过去」负责；这里只给「扫三连」用。
+func _swap_board(a: Vector2i, b: Vector2i) -> void:
+	var tmp = board[a.y][a.x]
+	board[a.y][a.x] = board[b.y][b.x]
+	board[b.y][b.x] = tmp
+
+
+# 把一格的 ColorRect 立刻放回它自己的格子位置（不播动画）。
+#   成功交换后会用到：颜色已经换过了，节点「瞬移回家」眼睛看不出来。
+func _snap_tile(pos: Vector2i) -> void:
+	_tiles[pos.y][pos.x].position = _grid_pos(pos)
+
+
+# ⑧ M7.2：让 a 格的方块滑到 dest_a 那个格子，b 格的方块滑到 dest_b。
+#   Tween = 「在一段时间里，把某个属性从现在的值缓到目标值」。
+#   await tween.finished = 「滑完之前，后面的代码先别跑」——没有这句就会边滑边结算。
+func _slide_pair(a: Vector2i, dest_a: Vector2i, b: Vector2i, dest_b: Vector2i) -> void:
+	var tween := create_tween()
+	tween.set_parallel(true) # 两块同时动，不要一个走完另一个才走
+	tween.tween_property(_tiles[a.y][a.x], "position", _grid_pos(dest_a), SWAP_DURATION)
+	tween.tween_property(_tiles[b.y][b.x], "position", _grid_pos(dest_b), SWAP_DURATION)
+	await tween.finished
+
+
+# ⑧ M7.2 核心：先看滑动，再改规则结果。
+#   顺序必须是：滑 → 试着换数据 → 问有没有三连 → 有就坐下并结算 / 没有就换回去再滑回来。
+#   为什么滑的时候先不换颜色？因为 ColorRect 还是「A 槽的那块」在往 B 走，
+#   它身上带着 A 的颜色；如果中途 _refresh_tile，就会出现「人还在走、衣服先换了」。
+func _try_swap(a: Vector2i, b: Vector2i) -> void:
+	await _slide_pair(a, b, b, a) # 两块走向对方的格子
+	_swap_board(a, b) # 数据层现在按「已经换过」来算
+	if _find_matches().is_empty():
+		_swap_board(a, b) # 不成三连：数据改回去，棋盘规则上等于没换
+		await _slide_pair(a, a, b, b) # 两块从对方格子走回家
+		_snap_tile(a) # 防浮点误差，保证正好压在格子上
+		_snap_tile(b)
+		return
+	# 成三连：节点还停在对方格子上，但 _tiles[A] 永远表示「A 这个槽」。
+	#   把节点瞬移回自己的槽，再按新数据刷新颜色——屏幕上的色块位置不变，换的是「谁负责画」。
+	_snap_tile(a)
+	_snap_tile(b)
+	_refresh_tile(a.y, a.x)
 	_refresh_tile(b.y, b.x)
+	_resolve_matches() # 有三连才结算；消除 / 下落这一步仍是瞬时的（M7.3 / M7.4）
 
 
 # ---------------------------------------------------------------
