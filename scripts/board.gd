@@ -1,9 +1,11 @@
 extends Node2D
 # =====================================================================
 # 开心消消乐 · 棋盘脚本
-# 已实现：M1–M7 + M8.1 重新开始
+# 已实现：M1–M7 + M8.1 重新开始 + M8.2 剩余步数
 # 【M8.1 一句话】按钮是「玩家发给棋盘的命令」，不走格子点击那条路。
 #   按了就打断当前动画，换一盘新棋，分数归零。正在播放的 await 会发现「这一局已经作废」，立刻停手。
+# 【M8.2 一句话】步数是「玩家的手数」，不是「消了几轮」。
+#   只有成功换出三连才扣 1 步，而且一出手就扣；后面连锁再消不再扣。回弹等于没出手。
 # 【M7.1 一句话】棋盘在「结算 / 动画」时是忙碌的：忙碌期间点击全部丢掉。
 # 【M7.2 一句话】交换不再瞬间换色，而是两块滑向对方；滑完再问「有没有三连」。
 #   有 → 坐下（节点弹回自己的格子、颜色跟上数据），再走原来的消除结算。
@@ -46,6 +48,9 @@ const ROWS := 8
 const COLS := 8
 # 每个方块在屏幕上占多少像素（边长 64px）
 const CELL_SIZE := 64
+# ⑫ 留给分数/步数的顶栏高度。游戏窗口从 y=0 开始画，
+#   标签如果放在 y=-62（棋盘上方屏幕外），运行时就看不见，只剩下面的按钮。
+const HUD_HEIGHT := 64
 # NONE 表示"当前没有任何格子被选中"。用 (-1,-1) 这个永远到不了的坐标当"空"。
 const NONE := Vector2i(-1, -1)
 # EMPTY 表示"这一格已经被消除，暂时空着"。用 -1 这个颜色编号里不存在的数当"空"。
@@ -77,6 +82,8 @@ const SWAP_DURATION := 0.18
 const ELIM_DURATION := 0.36
 # ⑩ M7.4：每下落一格用这么多秒。掉得越远，时间越长，看起来才像重力。
 const FALL_PER_CELL := 0.08
+# ⑫ M8.2：一局开始有多少步。改这个数字就能调难度。
+const START_MOVES := 20
 
 
 # ---------------------------------------------------------------
@@ -101,8 +108,12 @@ var _busy := false
 
 # ⑤ M5 计分：当前累积的总分
 var score: int = 0
+# ⑫ M8.2：这一局还剩几步。和 score 一样属于「这一局的数据」，不是棋盘格子。
+var moves: int = START_MOVES
 # 显示分数的文字标签（显示层的一部分，和 _tiles 是一家人）
 var _score_label: Label = null
+# ⑫ 显示剩余步数，放在分数旁边。
+var _moves_label: Label = null
 # ⑪ M8.1：重新开始按钮。它不经过格子点击，所以动画中也能按。
 var _restart_btn: Button = null
 # ⑪ 「这一局」的编号。每重开一次 +1。await 回来后如果编号变了，说明这局已经作废。
@@ -129,8 +140,7 @@ func _ready() -> void:
 	if _run_id != id:
 		return
 	_busy = false
-	score = 0
-	_score_label.text = "0"
+	_reset_round_hud()
 
 
 # ---------------------------------------------------------------
@@ -201,7 +211,7 @@ func _build_view() -> void:
 			var tile := ColorRect.new() # 新建一个矩形节点
 			tile.color = COLORS[board[r][c]] # 用数字查颜色，赋给它
 			tile.size = Vector2(CELL_SIZE, CELL_SIZE) # 宽高 64
-			tile.position = Vector2(c, r) * CELL_SIZE # 摆到 (列,行) 位置
+			tile.position = _grid_pos(Vector2i(c, r)) # 棋盘整体下移，给顶栏留位置
 			add_child(tile) # 挂到节点树里，"出现在屏幕上"
 
 			# 每个格子自己监听点击。
@@ -219,23 +229,34 @@ func _build_view() -> void:
 			row.append(tile)
 		_tiles.append(row)
 
-	# ⑤ M5：在棋盘上方画一个"分数"标签。
-	#   Label 是"文字控件"，横跨整个棋盘宽度、水平居中，让文字显示在正中间。
+	# ⑤ M5 + ⑫ M8.2：棋盘上方左边分数、右边步数。
+	#   两个 Label 各占一半宽度，数据分开、显示也分开。
+	var hud_w := COLS * CELL_SIZE * 0.5
 	_score_label = Label.new()
-	_score_label.text = str(score) # 初始分数 0
-	_score_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER # 文字水平居中
-	_score_label.size = Vector2(COLS * CELL_SIZE, 60) # 宽=棋盘宽（列数 × 格子边长），高 60
-	_score_label.position = Vector2(0, -62) # 放在棋盘上方一点
+	_score_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_score_label.size = Vector2(hud_w, HUD_HEIGHT)
+	_score_label.position = Vector2(0, 0)
+	_score_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	_score_label.add_theme_font_override("font", _ui_font())
-	_score_label.add_theme_font_size_override("font_size", 40) # 字号加大
-	add_child(_score_label) # 挂到节点树上
+	_score_label.add_theme_font_size_override("font_size", 32)
+	add_child(_score_label)
+
+	_moves_label = Label.new()
+	_moves_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_moves_label.size = Vector2(hud_w, HUD_HEIGHT)
+	_moves_label.position = Vector2(hud_w, 0)
+	_moves_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_moves_label.add_theme_font_override("font", _ui_font())
+	_moves_label.add_theme_font_size_override("font_size", 32)
+	add_child(_moves_label)
+	_refresh_hud() # 先画出「分数 0 / 步数 20」，开局结算后再归零分数、补满步数
 
 	# ⑪ M8.1：Button 是控件，按下会发出 pressed 信号。
 	#   信号 ≈「这件事发生了，请谁来处理」。这里连接到 _restart_game。
 	_restart_btn = Button.new()
 	_restart_btn.text = "重新开始"
 	_restart_btn.size = Vector2(COLS * CELL_SIZE, 44)
-	_restart_btn.position = Vector2(0, ROWS * CELL_SIZE + 16) # 棋盘正下方
+	_restart_btn.position = Vector2(0, HUD_HEIGHT + ROWS * CELL_SIZE + 16) # 棋盘正下方
 	_restart_btn.add_theme_font_override("font", _ui_font())
 	_restart_btn.add_theme_font_size_override("font_size", 22)
 	_restart_btn.pressed.connect(_restart_game)
@@ -319,9 +340,9 @@ func _clear_selection() -> void:
 func _is_neighbor(a: Vector2i, b: Vector2i) -> bool:
 	return abs(a.x - b.x) + abs(a.y - b.y) == 1
 
-# 格子 (r,c) 在屏幕上应处的左上角。滑动的起点 / 终点都用它，避免手写两遍乘法。
+# 格子在屏幕上应处的左上角。y 要加上 HUD_HEIGHT，整盘棋才在分数下面，而不是把标签挤出窗口。
 func _grid_pos(pos: Vector2i) -> Vector2:
-	return Vector2(pos.x, pos.y) * CELL_SIZE
+	return Vector2(pos.x * CELL_SIZE, pos.y * CELL_SIZE + HUD_HEIGHT)
 
 
 # 只改数据层：对调 board 里两个格子的颜色编号，不动画面。
@@ -365,6 +386,26 @@ func _sync_all_tiles() -> void:
 			_refresh_tile(r, c)
 
 
+# ⑫ 分数和步数都只从这里写到标签上。别在别处直接改 .text，免得漏掉一边。
+func _refresh_hud() -> void:
+	_score_label.text = "分数 %d" % score
+	_moves_label.text = "步数 %d" % moves
+
+
+# ⑫ 新一局：分数从 0 计，步数补满。开局自动消除不算玩家出手，所以在结算之后才调用。
+func _reset_round_hud() -> void:
+	score = 0
+	moves = START_MOVES
+	_refresh_hud()
+
+
+# ⑫ 成功换出三连时扣 1 步。连锁不再进这里——那不是新的一手。
+func _spend_move() -> void:
+	if moves > 0:
+		moves -= 1
+		_refresh_hud()
+
+
 # ⑪ M8.1：立刻打断并重开。不走格子点击，所以忙碌时也能按。
 #   先把 _run_id +1，正在 await 的旧流程回来后会对不上号，自动收手。
 func _restart_game() -> void:
@@ -379,8 +420,7 @@ func _restart_game() -> void:
 	if _run_id != id:
 		return # 又按了一次重开，让更新的那一次收尾
 	_busy = false
-	score = 0
-	_score_label.text = "0"
+	_reset_round_hud()
 
 
 # ⑧ M7.2：让 a 格的方块滑到 dest_a 那个格子，b 格的方块滑到 dest_b。
@@ -418,6 +458,7 @@ func _try_swap(a: Vector2i, b: Vector2i) -> void:
 	_snap_tile(b)
 	_refresh_tile(a.y, a.x)
 	_refresh_tile(b.y, b.x)
+	_spend_move() # ⑫ 成三连这一手立刻扣步，不等连锁播完
 	await _resolve_matches() # 有三连才结算；消除动画和下落动画都会 await，播完才解锁
 
 
@@ -509,7 +550,7 @@ func _reset_tile_xform(pos: Vector2i) -> void:
 func _eliminate(matched: Dictionary) -> void:
 	var id := _run_id
 	score += matched.size() * 10
-	_score_label.text = str(score)
+	_refresh_hud()
 
 	var tween := _new_tween()
 	tween.set_parallel(true)
