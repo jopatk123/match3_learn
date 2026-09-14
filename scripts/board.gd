@@ -1,12 +1,14 @@
 extends Node2D
 # =====================================================================
 # 开心消消乐 · 棋盘脚本
-# 已实现：M1–M6 核心规则 + M7.1 锁输入 + M7.2 交换滑动
+# 已实现：M1–M6 核心规则 + M7.1 锁输入 + M7.2 交换滑动 + M7.3 消除反馈
 # 【M7.1 一句话】棋盘在「结算 / 动画」时是忙碌的：忙碌期间点击全部丢掉。
 # 【M7.2 一句话】交换不再瞬间换色，而是两块滑向对方；滑完再问「有没有三连」。
 #   有 → 坐下（节点弹回自己的格子、颜色跟上数据），再走原来的消除结算。
 #   没有 → 滑回去（回弹），数据不动。这一步才让「乱换」看起来像被拒绝。
 #   滑动这段时间 _busy 一直为 true，M7.1 那把锁终于能被肉眼感觉到。
+# 【M7.3 一句话】要消的格子先缩小并淡出，播完再变成空洞；分数跟这次消除一起跳。
+#   下落仍是瞬时的（M7.4）。连锁每一轮都是：消的动画播完 → 再压实补块。
 # ---------------------------------------------------------------------
 # 【M3 新增一句话】消消乐的灵魂是一句大白话：
 #   交换之后，只要"横着或竖着连续 3 个以上同色"，就一起消失（斜的不算）。
@@ -68,6 +70,8 @@ const HIGHLIGHT := Color(1.2, 1.2, 1.2)
 const NORMAL := Color.WHITE
 # ⑧ M7.2：两块滑过去 / 滑回来各用这么多秒。数字越大动作越慢，方便看清楚。
 const SWAP_DURATION := 0.18
+# ⑨ M7.3：要消的格子缩小 + 淡出用这么多秒。
+const ELIM_DURATION := 0.36
 
 
 # ---------------------------------------------------------------
@@ -107,7 +111,7 @@ func _ready() -> void:
 	# 开局再结算一次：生成兜底万一还有三连，瞬间消干净。分数清零，不算开局分。
 	# 和游戏中同一套锁：结算时点不动。开局其实还点不到（画面刚出来），但规则要统一。
 	_busy = true
-	_resolve_matches()
+	await _resolve_matches()
 	_busy = false
 	score = 0
 	_score_label.text = "0"
@@ -316,7 +320,7 @@ func _try_swap(a: Vector2i, b: Vector2i) -> void:
 	_snap_tile(b)
 	_refresh_tile(a.y, a.x)
 	_refresh_tile(b.y, b.x)
-	_resolve_matches() # 有三连才结算；消除 / 下落这一步仍是瞬时的（M7.3 / M7.4）
+	await _resolve_matches() # 有三连才结算；先播消除动画，下落仍是瞬时的（M7.4）
 
 
 # ---------------------------------------------------------------
@@ -334,7 +338,7 @@ func _resolve_matches() -> void:
 		var matched := _find_matches() # 每次循环都重新扫一遍棋盘
 		if matched.is_empty():
 			return # 稳定了：没有三连，可以交给玩家继续玩
-		_eliminate(matched)
+		await _eliminate(matched) # ⑨ 等缩小淡出播完，再下落；连锁不会叠在同一帧里
 		_apply_gravity() # 下落 + 顶部补新块 → 可能又有三连 → 下一轮再扫
 	# 走到这里说明保险丝烧了。棋盘上可能还留着三连，打一行警告方便以后发现。
 	push_warning("连锁超过 CHAIN_LIMIT，棋盘可能仍有三连")
@@ -382,20 +386,44 @@ func _scan_dir(matched: Dictionary, dir: Vector2i) -> void:
 					matched["%d,%d" % [pos.y, pos.x]] = true
 
 
-# 把 matched 里记录的所有格子，统一设成 EMPTY（清空），并同步画面。
+# 把 matched 键 "行,列" 拆回格子坐标（x=列, y=行），和 _selected 同一套约定。
+func _cell_from_key(key: String) -> Vector2i:
+	var parts: PackedStringArray = key.split(",")
+	return Vector2i(int(parts[1]), int(parts[0]))
+
+
+# 消除动画会改 size / position / 透明度，播完必须还原。
+#   这个 ColorRect 还要继续当「这一格的显示槽」：先画洞，以后再画新颜色。
+func _reset_tile_xform(pos: Vector2i) -> void:
+	var tile: ColorRect = _tiles[pos.y][pos.x]
+	tile.size = Vector2(CELL_SIZE, CELL_SIZE)
+	tile.position = _grid_pos(pos)
+	tile.modulate = NORMAL
+
+
+# ⑨ M7.3：先计分，再让要消的格子缩小并淡出，播完才把数据改成空洞。
+#   分数不在滑动时加，也不等下落结束——就在「这一批格子正在消失」的时候加。
 func _eliminate(matched: Dictionary) -> void:
-	# ⑤ M5：先计分。matched.size() = 这次一共消掉几格（字典已自动去重）。
-	#   每消一格 +10 分，然后把新分数立刻显示到标签上。
 	score += matched.size() * 10
 	_score_label.text = str(score)
 
-	# 字典的每个键都是我们存的 "行,列" 字符串，拆回数字就能定位格子
+	var tween := create_tween()
+	tween.set_parallel(true)
 	for key in matched.keys():
-		var parts: PackedStringArray = key.split(",")
-		var r := int(parts[0])
-		var c := int(parts[1])
-		board[r][c] = EMPTY # 数据层：这一格变成"空"
-		_refresh_tile(r, c) # 画面层：同步成"洞"的颜色
+		var pos := _cell_from_key(key)
+		var tile: ColorRect = _tiles[pos.y][pos.x]
+		# ColorRect 默认从左上角缩；同时把左上角挪向格子中心，看起来才是「往中间瘪」。
+		var center := _grid_pos(pos) + Vector2(CELL_SIZE, CELL_SIZE) * 0.5
+		tween.tween_property(tile, "size", Vector2.ZERO, ELIM_DURATION)
+		tween.tween_property(tile, "position", center, ELIM_DURATION)
+		tween.tween_property(tile, "modulate:a", 0.0, ELIM_DURATION)
+	await tween.finished
+
+	for key in matched.keys():
+		var pos := _cell_from_key(key)
+		board[pos.y][pos.x] = EMPTY # 数据层：这一格变成"空"
+		_reset_tile_xform(pos) # 节点恢复成满格，准备画「洞」
+		_refresh_tile(pos.y, pos.x) # 画面层：同步成"洞"的颜色
 
 
 # M4 核心：下落补位。一列一列处理——
