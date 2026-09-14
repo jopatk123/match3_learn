@@ -1,7 +1,9 @@
 extends Node2D
 # =====================================================================
 # 开心消消乐 · 棋盘脚本
-# 已实现：M1–M6 核心规则 + M7.1–M7.4 打磨动画
+# 已实现：M1–M7 + M8.1 重新开始
+# 【M8.1 一句话】按钮是「玩家发给棋盘的命令」，不走格子点击那条路。
+#   按了就打断当前动画，换一盘新棋，分数归零。正在播放的 await 会发现「这一局已经作废」，立刻停手。
 # 【M7.1 一句话】棋盘在「结算 / 动画」时是忙碌的：忙碌期间点击全部丢掉。
 # 【M7.2 一句话】交换不再瞬间换色，而是两块滑向对方；滑完再问「有没有三连」。
 #   有 → 坐下（节点弹回自己的格子、颜色跟上数据），再走原来的消除结算。
@@ -101,6 +103,14 @@ var _busy := false
 var score: int = 0
 # 显示分数的文字标签（显示层的一部分，和 _tiles 是一家人）
 var _score_label: Label = null
+# ⑪ M8.1：重新开始按钮。它不经过格子点击，所以动画中也能按。
+var _restart_btn: Button = null
+# ⑪ 「这一局」的编号。每重开一次 +1。await 回来后如果编号变了，说明这局已经作废。
+var _run_id := 0
+# ⑪ 下落时临时生成的新块。重开时必须先扔掉，否则会漂在新棋盘上。
+var _spawn_tiles: Array = []
+# ⑪ 当前棋盘上还在播的 Tween。重开时全部 kill，动画才会立刻停。
+var _tweens: Array = []
 
 
 # ---------------------------------------------------------------
@@ -114,7 +124,10 @@ func _ready() -> void:
 	# 开局再结算一次：生成兜底万一还有三连，瞬间消干净。分数清零，不算开局分。
 	# 和游戏中同一套锁：结算时点不动。开局其实还点不到（画面刚出来），但规则要统一。
 	_busy = true
+	var id := _run_id
 	await _resolve_matches()
+	if _run_id != id:
+		return
 	_busy = false
 	score = 0
 	_score_label.text = "0"
@@ -213,8 +226,37 @@ func _build_view() -> void:
 	_score_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER # 文字水平居中
 	_score_label.size = Vector2(COLS * CELL_SIZE, 60) # 宽=棋盘宽（列数 × 格子边长），高 60
 	_score_label.position = Vector2(0, -62) # 放在棋盘上方一点
+	_score_label.add_theme_font_override("font", _ui_font())
 	_score_label.add_theme_font_size_override("font_size", 40) # 字号加大
 	add_child(_score_label) # 挂到节点树上
+
+	# ⑪ M8.1：Button 是控件，按下会发出 pressed 信号。
+	#   信号 ≈「这件事发生了，请谁来处理」。这里连接到 _restart_game。
+	_restart_btn = Button.new()
+	_restart_btn.text = "重新开始"
+	_restart_btn.size = Vector2(COLS * CELL_SIZE, 44)
+	_restart_btn.position = Vector2(0, ROWS * CELL_SIZE + 16) # 棋盘正下方
+	_restart_btn.add_theme_font_override("font", _ui_font())
+	_restart_btn.add_theme_font_size_override("font_size", 22)
+	_restart_btn.pressed.connect(_restart_game)
+	add_child(_restart_btn)
+
+
+# Godot 自带字体（Open Sans）没有中文，按钮会像「空的」。
+# SystemFont 按名字向系统要字体；macOS 上「PingFang SC」在列表里，但引擎画不出来（字宽=0），
+# 放第一位会挡住后面真正能用的字库。所以把实测能画中文的名字放前面。
+func _ui_font() -> SystemFont:
+	var font := SystemFont.new()
+	font.font_names = PackedStringArray([
+		"Hiragino Sans GB", # macOS：冬青黑体简体，实测能画出「重新开始」
+		"Songti SC",
+		"STHeiti",
+		"Heiti SC",
+		"Microsoft YaHei", # Windows
+		"Noto Sans CJK SC",
+		"WenQuanYi Micro Hei",
+	])
+	return font
 
 
 # 让显示层第 (r,c) 个格子的颜色，和数据层 board[r][c] 重新对齐。
@@ -250,8 +292,11 @@ func _on_tile_clicked(r: int, c: int) -> void:
 		#    整段动画 + 后面的结算都算忙碌，所以 M7.1 的锁会一直握住。
 		_busy = true
 		var from := _selected
+		var id := _run_id
 		_clear_selection() # 先取消高亮，别让「发光」跟着滑
 		await _try_swap(from, pos)
+		if _run_id != id:
+			return # 滑动中途被重开了：不要再改 _busy，新一局自己会管
 		_busy = false
 	else:
 		_set_selected(pos) # ④ 点不相邻 → 改成选中这一格
@@ -293,11 +338,56 @@ func _snap_tile(pos: Vector2i) -> void:
 	_tiles[pos.y][pos.x].position = _grid_pos(pos)
 
 
+# 记录并返回一个 Tween。重开时靠 _tweens 列表把它们全部停掉。
+func _new_tween() -> Tween:
+	var tween := create_tween()
+	_tweens.append(tween)
+	return tween
+
+
+# ⑪ 作废当前动画：停掉 Tween，扔掉天上还在掉的临时块。
+func _interrupt_anims() -> void:
+	for tween in _tweens:
+		if tween is Tween and (tween as Tween).is_valid():
+			(tween as Tween).kill()
+	_tweens.clear()
+	for spawn in _spawn_tiles:
+		if is_instance_valid(spawn):
+			(spawn as Node).queue_free()
+	_spawn_tiles.clear()
+
+
+# 所有格子回到自己的槽位、正常大小和透明度，再按 board 上色。
+func _sync_all_tiles() -> void:
+	for r in ROWS:
+		for c in COLS:
+			_reset_tile_xform(Vector2i(c, r))
+			_refresh_tile(r, c)
+
+
+# ⑪ M8.1：立刻打断并重开。不走格子点击，所以忙碌时也能按。
+#   先把 _run_id +1，正在 await 的旧流程回来后会对不上号，自动收手。
+func _restart_game() -> void:
+	_run_id += 1
+	var id := _run_id
+	_interrupt_anims()
+	_selected = NONE # 不要走 _clear_selection：格子可能正缩成 0，直接清状态即可
+	_build_data()
+	_sync_all_tiles()
+	_busy = true
+	await _resolve_matches()
+	if _run_id != id:
+		return # 又按了一次重开，让更新的那一次收尾
+	_busy = false
+	score = 0
+	_score_label.text = "0"
+
+
 # ⑧ M7.2：让 a 格的方块滑到 dest_a 那个格子，b 格的方块滑到 dest_b。
 #   Tween = 「在一段时间里，把某个属性从现在的值缓到目标值」。
 #   await tween.finished = 「滑完之前，后面的代码先别跑」——没有这句就会边滑边结算。
 func _slide_pair(a: Vector2i, dest_a: Vector2i, b: Vector2i, dest_b: Vector2i) -> void:
-	var tween := create_tween()
+	var tween := _new_tween()
 	tween.set_parallel(true) # 两块同时动，不要一个走完另一个才走
 	tween.tween_property(_tiles[a.y][a.x], "position", _grid_pos(dest_a), SWAP_DURATION)
 	tween.tween_property(_tiles[b.y][b.x], "position", _grid_pos(dest_b), SWAP_DURATION)
@@ -309,11 +399,16 @@ func _slide_pair(a: Vector2i, dest_a: Vector2i, b: Vector2i, dest_b: Vector2i) -
 #   为什么滑的时候先不换颜色？因为 ColorRect 还是「A 槽的那块」在往 B 走，
 #   它身上带着 A 的颜色；如果中途 _refresh_tile，就会出现「人还在走、衣服先换了」。
 func _try_swap(a: Vector2i, b: Vector2i) -> void:
+	var id := _run_id
 	await _slide_pair(a, b, b, a) # 两块走向对方的格子
+	if _run_id != id:
+		return
 	_swap_board(a, b) # 数据层现在按「已经换过」来算
 	if _find_matches().is_empty():
 		_swap_board(a, b) # 不成三连：数据改回去，棋盘规则上等于没换
 		await _slide_pair(a, a, b, b) # 两块从对方格子走回家
+		if _run_id != id:
+			return
 		_snap_tile(a) # 防浮点误差，保证正好压在格子上
 		_snap_tile(b)
 		return
@@ -337,12 +432,17 @@ func _try_swap(a: Vector2i, b: Vector2i) -> void:
 #   只消一轮就会把新三连留在棋盘上（测试时看到的那种），所以必须循环。
 #   for + CHAIN_LIMIT 是保险丝；正常情况会在远小于上限时因 matched 为空而结束。
 func _resolve_matches() -> void:
+	var id := _run_id
 	for _round in CHAIN_LIMIT:
 		var matched := _find_matches() # 每次循环都重新扫一遍棋盘
 		if matched.is_empty():
 			return # 稳定了：没有三连，可以交给玩家继续玩
 		await _eliminate(matched) # ⑨ 等缩小淡出播完，再下落
+		if _run_id != id:
+			return
 		await _apply_gravity() # ⑩ 等方块掉完，再扫下一轮三连——两轮画面不会叠在一起
+		if _run_id != id:
+			return
 	# 走到这里说明保险丝烧了。棋盘上可能还留着三连，打一行警告方便以后发现。
 	push_warning("连锁超过 CHAIN_LIMIT，棋盘可能仍有三连")
 
@@ -407,10 +507,11 @@ func _reset_tile_xform(pos: Vector2i) -> void:
 # ⑨ M7.3：先计分，再让要消的格子缩小并淡出，播完才把数据改成空洞。
 #   分数不在滑动时加，也不等下落结束——就在「这一批格子正在消失」的时候加。
 func _eliminate(matched: Dictionary) -> void:
+	var id := _run_id
 	score += matched.size() * 10
 	_score_label.text = str(score)
 
-	var tween := create_tween()
+	var tween := _new_tween()
 	tween.set_parallel(true)
 	for key in matched.keys():
 		var pos := _cell_from_key(key)
@@ -421,6 +522,8 @@ func _eliminate(matched: Dictionary) -> void:
 		tween.tween_property(tile, "position", center, ELIM_DURATION)
 		tween.tween_property(tile, "modulate:a", 0.0, ELIM_DURATION)
 	await tween.finished
+	if _run_id != id:
+		return
 
 	for key in matched.keys():
 		var pos := _cell_from_key(key)
@@ -443,6 +546,7 @@ func _make_spawn_tile(c: int, start_r: int, color: int) -> ColorRect:
 	tile.position = _grid_pos(Vector2i(c, start_r))
 	tile.mouse_filter = Control.MOUSE_FILTER_IGNORE # 临时块不抢点击
 	add_child(tile)
+	_spawn_tiles.append(tile)
 	return tile
 
 
@@ -453,12 +557,12 @@ func _make_spawn_tile(c: int, start_r: int, color: int) -> ColorRect:
 #   ④ 存活块：把它的槽节点 tween 到新行；新块：从棋盘上方的临时节点掉进顶行
 #   ⑤ 播完：扔掉临时节点，所有槽瞬移回家并 _refresh_tile（和 M7.2 同一招）
 func _apply_gravity() -> void:
-	var tween := create_tween()
+	var id := _run_id
+	var tween := _new_tween()
 	tween.set_parallel(true)
 	tween.set_trans(Tween.TRANS_QUAD)
 	tween.set_ease(Tween.EASE_IN) # 越落越快，一点重力感
 	var moving := false
-	var spawns: Array = [] # 播完要 queue_free 的临时块
 
 	for c in COLS:
 		var pieces: Array = [] # {from_r, color} 从底往上，和旧逻辑一样
@@ -490,7 +594,6 @@ func _apply_gravity() -> void:
 			board[write_r][c] = color
 			var start_r: int = write_r - new_count # 例如要补 3 块，最底下那块从 -1 行进
 			var spawn := _make_spawn_tile(c, start_r, color)
-			spawns.append(spawn)
 			moving = true
 			tween.tween_property(
 				spawn,
@@ -504,11 +607,12 @@ func _apply_gravity() -> void:
 		await tween.finished
 	else:
 		tween.kill() # 没有洞就没有动画，空 Tween 不要挂着等
+	if _run_id != id:
+		return
 
-	for spawn in spawns:
-		(spawn as ColorRect).queue_free()
+	for spawn in _spawn_tiles:
+		if is_instance_valid(spawn):
+			(spawn as Node).queue_free()
+	_spawn_tiles.clear()
 
-	for r in ROWS:
-		for c in COLS:
-			_reset_tile_xform(Vector2i(c, r))
-			_refresh_tile(r, c)
+	_sync_all_tiles()
