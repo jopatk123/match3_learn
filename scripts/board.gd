@@ -1,14 +1,15 @@
 extends Node2D
 # =====================================================================
 # 开心消消乐 · 棋盘脚本
-# 已实现：M1–M6 核心规则 + M7.1 锁输入 + M7.2 交换滑动 + M7.3 消除反馈
+# 已实现：M1–M6 核心规则 + M7.1–M7.4 打磨动画
 # 【M7.1 一句话】棋盘在「结算 / 动画」时是忙碌的：忙碌期间点击全部丢掉。
 # 【M7.2 一句话】交换不再瞬间换色，而是两块滑向对方；滑完再问「有没有三连」。
 #   有 → 坐下（节点弹回自己的格子、颜色跟上数据），再走原来的消除结算。
 #   没有 → 滑回去（回弹），数据不动。这一步才让「乱换」看起来像被拒绝。
 #   滑动这段时间 _busy 一直为 true，M7.1 那把锁终于能被肉眼感觉到。
 # 【M7.3 一句话】要消的格子先缩小并淡出，播完再变成空洞；分数跟这次消除一起跳。
-#   下落仍是瞬时的（M7.4）。连锁每一轮都是：消的动画播完 → 再压实补块。
+# 【M7.4 一句话】存活的方块沿列真正往下掉，新块从棋盘顶上掉进来。
+#   连锁必须「这一轮：消除动画 → 下落动画」全部播完，再开始下一轮消除。
 # ---------------------------------------------------------------------
 # 【M3 新增一句话】消消乐的灵魂是一句大白话：
 #   交换之后，只要"横着或竖着连续 3 个以上同色"，就一起消失（斜的不算）。
@@ -72,6 +73,8 @@ const NORMAL := Color.WHITE
 const SWAP_DURATION := 0.18
 # ⑨ M7.3：要消的格子缩小 + 淡出用这么多秒。
 const ELIM_DURATION := 0.36
+# ⑩ M7.4：每下落一格用这么多秒。掉得越远，时间越长，看起来才像重力。
+const FALL_PER_CELL := 0.08
 
 
 # ---------------------------------------------------------------
@@ -320,7 +323,7 @@ func _try_swap(a: Vector2i, b: Vector2i) -> void:
 	_snap_tile(b)
 	_refresh_tile(a.y, a.x)
 	_refresh_tile(b.y, b.x)
-	await _resolve_matches() # 有三连才结算；先播消除动画，下落仍是瞬时的（M7.4）
+	await _resolve_matches() # 有三连才结算；消除动画和下落动画都会 await，播完才解锁
 
 
 # ---------------------------------------------------------------
@@ -338,8 +341,8 @@ func _resolve_matches() -> void:
 		var matched := _find_matches() # 每次循环都重新扫一遍棋盘
 		if matched.is_empty():
 			return # 稳定了：没有三连，可以交给玩家继续玩
-		await _eliminate(matched) # ⑨ 等缩小淡出播完，再下落；连锁不会叠在同一帧里
-		_apply_gravity() # 下落 + 顶部补新块 → 可能又有三连 → 下一轮再扫
+		await _eliminate(matched) # ⑨ 等缩小淡出播完，再下落
+		await _apply_gravity() # ⑩ 等方块掉完，再扫下一轮三连——两轮画面不会叠在一起
 	# 走到这里说明保险丝烧了。棋盘上可能还留着三连，打一行警告方便以后发现。
 	push_warning("连锁超过 CHAIN_LIMIT，棋盘可能仍有三连")
 
@@ -426,30 +429,86 @@ func _eliminate(matched: Dictionary) -> void:
 		_refresh_tile(pos.y, pos.x) # 画面层：同步成"洞"的颜色
 
 
-# M4 核心：下落补位。一列一列处理——
-#   ① 从下往上，把这列里"还有颜色"的格子数出来（去掉空位）
-#   ② 从最底行开始，把这些方块原样码回去（等于整体砸到底）
-#   ③ 顶部空出来的位置，用随机新颜色填上
+# ⑩ 掉了几格，就播几格的时间。from_r 可以是负数（棋盘上方的出生点）。
+func _fall_duration(from_r: int, to_r: int) -> float:
+	return abs(to_r - from_r) * FALL_PER_CELL
+
+
+# 从棋盘上方掉进来的新块，不能占用「格子槽」节点——槽还在自己的格子上。
+#   所以临时新建一个 ColorRect，播完扔掉，再把颜色写回槽里。
+func _make_spawn_tile(c: int, start_r: int, color: int) -> ColorRect:
+	var tile := ColorRect.new()
+	tile.color = COLORS[color]
+	tile.size = Vector2(CELL_SIZE, CELL_SIZE)
+	tile.position = _grid_pos(Vector2i(c, start_r))
+	tile.mouse_filter = Control.MOUSE_FILTER_IGNORE # 临时块不抢点击
+	add_child(tile)
+	return tile
+
+
+# M4 规则 + M7.4 动画：数据层仍然「压实再补顶」，但显示层要真的往下飞。
+#   ① 先记下这一列每个存活块现在在哪一行（动画要从这里出发）
+#   ② 把洞藏起来，避免方块从灰色洞上滑过去很难看
+#   ③ 按 M4 写出新的 board（压实 + 顶部随机）
+#   ④ 存活块：把它的槽节点 tween 到新行；新块：从棋盘上方的临时节点掉进顶行
+#   ⑤ 播完：扔掉临时节点，所有槽瞬移回家并 _refresh_tile（和 M7.2 同一招）
 func _apply_gravity() -> void:
-	for c in COLS: # 列与列互不干扰，逐列扫
-		var col: Array = [] # 临时存"这一列里还活着的方块"
-		for r in range(ROWS - 1, -1, -1): # 注意：从最底行往上走
-			if board[r][c] != EMPTY: # 不是洞才收进来，"压实"把洞挤掉
-				col.append(board[r][c])
+	var tween := create_tween()
+	tween.set_parallel(true)
+	tween.set_trans(Tween.TRANS_QUAD)
+	tween.set_ease(Tween.EASE_IN) # 越落越快，一点重力感
+	var moving := false
+	var spawns: Array = [] # 播完要 queue_free 的临时块
 
-		# 从最底行往上，把收好的方块一本一本码回去
-		#   col 的顺序是 [最底…最顶]，从底开始放正好保持上下关系不变
+	for c in COLS:
+		var pieces: Array = [] # {from_r, color} 从底往上，和旧逻辑一样
+		for r in range(ROWS - 1, -1, -1):
+			if board[r][c] != EMPTY:
+				pieces.append({"from_r": r, "color": board[r][c]})
+			else:
+				_tiles[r][c].modulate.a = 0.0 # 先把洞隐掉，下落过程中不要露灰底
+
 		var write_r := ROWS - 1
-		for value in col:
-			board[write_r][c] = value
+		for piece in pieces:
+			var from_r: int = piece["from_r"]
+			var to_r: int = write_r
+			board[to_r][c] = piece["color"]
+			if to_r != from_r:
+				moving = true
+				tween.tween_property(
+					_tiles[from_r][c],
+					"position",
+					_grid_pos(Vector2i(c, to_r)),
+					_fall_duration(from_r, to_r)
+				)
 			write_r -= 1
 
-		# 现在 write_r 及以上的格子都是空的，补上随机新方块
+		# write_r 及以上要补新块。它们在棋盘上「本来就叠在顶上」，一起掉同样的距离。
+		var new_count := write_r + 1
 		while write_r >= 0:
-			board[write_r][c] = randi() % COLORS.size()
+			var color: int = randi() % COLORS.size()
+			board[write_r][c] = color
+			var start_r: int = write_r - new_count # 例如要补 3 块，最底下那块从 -1 行进
+			var spawn := _make_spawn_tile(c, start_r, color)
+			spawns.append(spawn)
+			moving = true
+			tween.tween_property(
+				spawn,
+				"position",
+				_grid_pos(Vector2i(c, write_r)),
+				_fall_duration(start_r, write_r)
+			)
 			write_r -= 1
 
-	# 数据层全部改完，统一刷新画面（只用 _refresh_tile 这一个出口）
+	if moving:
+		await tween.finished
+	else:
+		tween.kill() # 没有洞就没有动画，空 Tween 不要挂着等
+
+	for spawn in spawns:
+		(spawn as ColorRect).queue_free()
+
 	for r in ROWS:
 		for c in COLS:
+			_reset_tile_xform(Vector2i(c, r))
 			_refresh_tile(r, c)
